@@ -104,12 +104,41 @@ impl From<crate::db::donations_repo::DbError> for StellarAidError {
     }
 }
 
+impl crate::utils::retry::IsRetryable for StellarAidError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            StellarAidError::NetworkError(_) => true,
+            StellarAidError::HorizonError(msg) => {
+                msg.contains("timeout")
+                    || msg.contains("50")
+                    || msg.contains("429")
+                    || msg.contains("connect")
+            }
+            StellarAidError::SorobanError { code, .. } => {
+                *code == -32000 || *code == -32603 || *code == 429
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::friendbot::utils::types::StellarError;
     use crate::setup::token_setup::TokenSetupError;
     use crate::utils::keypair::KeyError;
+    use crate::utils::retry::IsRetryable;
+
+    #[test]
+    fn retryable_errors_distinguished_correctly() {
+        assert!(StellarAidError::NetworkError("connection reset".into()).is_retryable());
+        assert!(StellarAidError::HorizonError("504 gateway timeout".into()).is_retryable());
+        assert!(StellarAidError::SorobanError { code: -32000, message: "rate limited".into() }.is_retryable());
+        assert!(!StellarAidError::KeypairError("invalid signature".into()).is_retryable());
+        assert!(!StellarAidError::ValidationError("empty address".into()).is_retryable());
+        assert!(!StellarAidError::ContractError("custom error 1".into()).is_retryable());
+    }
 
     #[test]
     fn key_error_converts_to_keypair_variant() {

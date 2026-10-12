@@ -17,6 +17,20 @@ pub enum HorizonError {
     Other(String),
 }
 
+impl crate::utils::retry::IsRetryable for HorizonError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            HorizonError::Reqwest(err) => {
+                err.is_timeout()
+                    || err.is_connect()
+                    || err.status().is_some_and(|s| s.is_server_error() || s.as_u16() == 429)
+            }
+            HorizonError::Http(status, _) => *status >= 500 || *status == 429 || *status == 408,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct HorizonClient {
     base_url: String,
@@ -39,14 +53,21 @@ impl HorizonClient {
 
     async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, HorizonError> {
         let url = format!("{}{}", self.base_url, path);
-        let resp = self.client.get(&url).send().await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            return Err(HorizonError::Http(status.as_u16(), text));
-        }
-        let parsed = serde_json::from_str(&text)?;
-        Ok(parsed)
+        crate::utils::retry::retry_with_backoff(
+            || async {
+                let resp = self.client.get(&url).send().await?;
+                let status = resp.status();
+                let text = resp.text().await?;
+                if !status.is_success() {
+                    return Err(HorizonError::Http(status.as_u16(), text));
+                }
+                let parsed = serde_json::from_str(&text)?;
+                Ok(parsed)
+            },
+            3,
+            std::time::Duration::from_millis(200),
+        )
+        .await
     }
 
     pub async fn get_account(&self, address: &str) -> Result<AccountResponse, HorizonError> {

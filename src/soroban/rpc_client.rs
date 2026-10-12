@@ -15,6 +15,20 @@ pub enum RpcError {
     Deserialize(String),
 }
 
+impl crate::utils::retry::IsRetryable for RpcError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            RpcError::Http(err) => {
+                err.is_timeout()
+                    || err.is_connect()
+                    || err.status().is_some_and(|s| s.is_server_error() || s.as_u16() == 429)
+            }
+            RpcError::Rpc { code, .. } => *code == -32000 || *code == -32603 || *code == 429,
+            RpcError::Deserialize(_) => false,
+        }
+    }
+}
+
 // ── JSON-RPC plumbing ──────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -172,25 +186,32 @@ impl SorobanRpcClient {
             params,
         };
 
-        let resp = self
-            .http
-            .post(&self.endpoint)
-            .json(&req)
-            .send()
-            .await?
-            .json::<JsonRpcResponse<T>>()
-            .await?;
+        crate::utils::retry::retry_with_backoff(
+            || async {
+                let resp = self
+                    .http
+                    .post(&self.endpoint)
+                    .json(&req)
+                    .send()
+                    .await?
+                    .json::<JsonRpcResponse<T>>()
+                    .await?;
 
-        if let Some(err) = resp.error {
-            return Err(RpcError::Rpc {
-                code: err.code,
-                message: err.message,
-            });
-        }
+                if let Some(err) = resp.error {
+                    return Err(RpcError::Rpc {
+                        code: err.code,
+                        message: err.message,
+                    });
+                }
 
-        resp.result.ok_or_else(|| {
-            RpcError::Deserialize("response contained neither result nor error".into())
-        })
+                resp.result.ok_or_else(|| {
+                    RpcError::Deserialize("response contained neither result nor error".into())
+                })
+            },
+            3,
+            std::time::Duration::from_millis(200),
+        )
+        .await
     }
 
     // ── Public API ─────────────────────────────────────────────────────────────
